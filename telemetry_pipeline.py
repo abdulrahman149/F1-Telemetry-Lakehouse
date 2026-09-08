@@ -5,6 +5,7 @@ from datetime import datetime
 
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions
+from apache_beam.metrics import Metrics
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 import fastf1
@@ -46,6 +47,10 @@ class LapSummaryModel(BaseModel):
 # 2. Extraction & Transformation
 # using fastf1 for extracting data and pandas for data manipulation and cleaning
 class ExtractSessionData(beam.DoFn):
+    # Counters tracking records that fail the Pydantic data contracts (schema-level anomalies)
+    lap_summary_rejected = Metrics.counter('ExtractSessionData', 'lap_summary_validation_rejected')
+    telemetry_rejected = Metrics.counter('ExtractSessionData', 'telemetry_validation_rejected')
+
     # process method for extracting data
     def process(self, session_meta: Tuple[int, str, str]) -> Generator[Dict[str, Any], None, None]:
         year, gp_name, session_type = session_meta
@@ -81,21 +86,28 @@ class ExtractSessionData(beam.DoFn):
                 lap_no = int(lap['LapNumber'])
                 lap_time_sec = lap['LapTime'].total_seconds()
                 
-                yield {
-                    'type': 'fact_lap_summary',
-                    'data': {
-                        'session_id': session_id,
-                        'driver_number': str(driver_num),
-                        'lap_number': lap_no,
-                        'lap_time_seconds': round(lap_time_sec, 3),
-                        'sector_1_seconds': round(lap['Sector1Time'].total_seconds(), 3) if pd.notnull(lap['Sector1Time']) else None,
-                        'sector_2_seconds': round(lap['Sector2Time'].total_seconds(), 3) if pd.notnull(lap['Sector2Time']) else None,
-                        'sector_3_seconds': round(lap['Sector3Time'].total_seconds(), 3) if pd.notnull(lap['Sector3Time']) else None,
-                        'tire_compound': str(lap.get('Compound', 'UNKNOWN')),
-                        'tire_age_laps': int(lap.get('TyreLife', 0)) if pd.notnull(lap.get('TyreLife')) else 0,
-                        'fuel_corrected_lap_time': round(lap_time_sec + ((50 - lap_no) * 0.038), 3) # Approximate fuel penalty
-                    }
+                lap_summary_data = {
+                    'session_id': session_id,
+                    'driver_number': str(driver_num),
+                    'lap_number': lap_no,
+                    'lap_time_seconds': round(lap_time_sec, 3),
+                    'sector_1_seconds': round(lap['Sector1Time'].total_seconds(), 3) if pd.notnull(lap['Sector1Time']) else None,
+                    'sector_2_seconds': round(lap['Sector2Time'].total_seconds(), 3) if pd.notnull(lap['Sector2Time']) else None,
+                    'sector_3_seconds': round(lap['Sector3Time'].total_seconds(), 3) if pd.notnull(lap['Sector3Time']) else None,
+                    'tire_compound': str(lap.get('Compound', 'UNKNOWN')),
+                    'tire_age_laps': int(lap.get('TyreLife', 0)) if pd.notnull(lap.get('TyreLife')) else 0,
+                    'fuel_corrected_lap_time': round(lap_time_sec + ((50 - lap_no) * 0.038), 3) # Approximate fuel penalty
                 }
+
+                # Validate against the LapSummaryModel data contract before loading;
+                # reject (count + log, don't yield) anything that fails the physical/schema constraints
+                try:
+                    LapSummaryModel(**lap_summary_data)
+                except ValidationError as ve:
+                    self.lap_summary_rejected.inc()
+                    logging.warning(f"Rejected lap summary record [session={session_id}, driver={driver_num}, lap={lap_no}]: {ve}")
+                else:
+                    yield {'type': 'fact_lap_summary', 'data': lap_summary_data}
 
                 # Extracting telemetry data with the keys built above
                 try:
@@ -112,20 +124,29 @@ class ExtractSessionData(beam.DoFn):
                             for i, d in enumerate(uniform_dist):
                                 throttle_val = float(resampled_throttle[i])
                                 speed_val = float(resampled_speed[i])
-                                yield {
-                                    'type': 'fact_lap_telemetry',
-                                    'data': {
-                                        'session_id': session_id,
-                                        'driver_number': str(driver_num),
-                                        'lap_number': lap_no,
-                                        'distance_meters': float(round(d, 2)),
-                                        'speed_kmh': float(round(speed_val, 2)),
-                                        'throttle_pct': float(round(throttle_val, 2)),
-                                        'brake': bool(throttle_val < 5.0 and speed_val < 260.0),
-                                        'gear': int(resampled_gear[i]),
-                                        'drs_status': int(resampled_drs[i])
-                                    }
+                                telemetry_data = {
+                                    'session_id': session_id,
+                                    'driver_number': str(driver_num),
+                                    'lap_number': lap_no,
+                                    'distance_meters': float(round(d, 2)),
+                                    'speed_kmh': float(round(speed_val, 2)),
+                                    'throttle_pct': float(round(throttle_val, 2)),
+                                    'brake': bool(throttle_val < 5.0 and speed_val < 260.0),
+                                    'gear': int(resampled_gear[i]),
+                                    'drs_status': int(resampled_drs[i])
                                 }
+
+                                # Validate against the TelemetryModel data contract (e.g. speed <= 390 km/h,
+                                # 0 <= throttle <= 100, 0 <= gear <= 8); reject and count anomalies instead of
+                                # loading them silently. Caught here (not the outer except) so it's never
+                                # swallowed by the session-level fallback below.
+                                try:
+                                    TelemetryModel(**telemetry_data)
+                                except ValidationError as ve:
+                                    self.telemetry_rejected.inc()
+                                    logging.warning(f"Rejected telemetry point [session={session_id}, driver={driver_num}, lap={lap_no}, dist={d:.1f}m]: {ve}")
+                                else:
+                                    yield {'type': 'fact_lap_telemetry', 'data': telemetry_data}
                 except Exception:
                     pass
 
@@ -216,7 +237,14 @@ def run():
         raw_stream = (p | 'Define Sessions' >> beam.Create(sessions_to_process)
                         | 'Extract Data' >> beam.ParDo(ExtractSessionData()))
         
-        raw_stream | 'Write DB' >> beam.ParDo(PostgresBatchWriter())
+        result = raw_stream | 'Write DB' >> beam.ParDo(PostgresBatchWriter())
+
+    # Report how many records failed the Pydantic data contracts and were dropped,
+    # so the run has an actual, auditable anomaly count instead of a guess.
+    pipeline_result = p.result
+    metrics = pipeline_result.metrics().query(beam.metrics.MetricsFilter().with_namespace('ExtractSessionData'))
+    for counter in metrics['counters']:
+        logging.info(f"[METRIC] {counter.key.metric.name}: {counter.committed}")
 
 if __name__ == '__main__':
     run()
