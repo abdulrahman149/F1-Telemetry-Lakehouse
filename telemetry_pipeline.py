@@ -136,10 +136,7 @@ class ExtractSessionData(beam.DoFn):
                                     'drs_status': int(resampled_drs[i])
                                 }
 
-                                # Validate against the TelemetryModel data contract (e.g. speed <= 390 km/h,
-                                # 0 <= throttle <= 100, 0 <= gear <= 8); reject and count anomalies instead of
-                                # loading them silently. Caught here (not the outer except) so it's never
-                                # swallowed by the session-level fallback below.
+                                # Validate against the TelemetryModel data contract 
                                 try:
                                     TelemetryModel(**telemetry_data)
                                 except ValidationError as ve:
